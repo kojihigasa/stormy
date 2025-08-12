@@ -24,7 +24,7 @@ jobs:
         run: |
           mkdir -p dist
           GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -o stormy${{ matrix.goos == 'windows' && '.exe' || '' }}
-          tar -czvf dist/stormy-${TAG}-${{ matrix.goarch }}-${{ matrix.goos }}.tar.gz stormy${{ matrix.goos == 'windows' && '.exe' || '' }} README.md LICENCE
+          tar -czvf dist/stormy-${TAG}-${{ matrix.goarch }}-${{ matrix.goos }}.tar.gz stormy${{ matrix.goos == 'windows' && '.exe' || '' }} README.md LICENSE
       - name: Upload Release Asset
         uses: softprops/action-gh-release@v1
         with:
