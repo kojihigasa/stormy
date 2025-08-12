@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>Stormy Redis Dashboard</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    :root { --card-bg:#fafbfc; --muted:#777; --border:#e0e0e0; --brand:#0074d9; }
+    body { font-family: -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; background: #fff; color: #222; margin: 0; }
+    header { font-family: -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; background: #f5f5f5; padding: 1rem 2rem; font-size: 1.5rem; border-bottom: 1px solid #eee; position: relative; }
+    main { max-width: 1400px; margin: 2rem auto; background: #fff; border-radius: 12px; box-shadow: 0 2px 12px #0001; padding: 1.5rem; }
+    h2 { color: var(--brand); margin: 0 0 1rem; }
+    h3 { margin: .25rem 0 .75rem; color: var(--brand); }
+    .home-link {
+      color: #222;
+      text-decoration: none;
+    }
+    .home-link:hover {
+      text-decoration: none;
+    }
+    .charts-row { display: flex; gap: 1rem; margin-bottom: 1rem; flex-wrap: wrap; }
+    .chart-container {
+      background: var(--card-bg); border-radius: 8px; padding: .75rem; box-shadow: 0 1px 4px #0001;
+      flex: 1 1 0; min-width: 280px; max-width: 420px; height: 220px; display: flex; align-items: center; justify-content: center;
+    }
+    .chart-container canvas { width: 100% !important; height: 160px !important; }
+    .master-block { margin-bottom: 1.5rem; border: 1px solid var(--border); border-radius: 10px; padding: 1rem; }
+    .instance-info-table, .history-table { border-collapse: collapse; width: 100%; }
+    .instance-info-table th, .instance-info-table td, .history-table th, .history-table td {
+      border: 1px solid var(--border); padding: 0.35rem 0.55rem; text-align: left;
+    }
+    .instance-info-table th { background: #f5f5f5; width: 160px; }
+    .history-table th { background: #f5f5f5; }
+    .num { text-align: right; font-variant-numeric: tabular-nums; }
+    .muted { color: var(--muted); }
+
+    /* master info table + its replicas side-by-side */
+    .info-row { display: flex; gap: 1rem; align-items: flex-start; }
+    .info-col { flex: 1 1 0; min-width: 280px; }
+    .replica-card { border: 1px solid var(--border); border-radius: 10px; padding: .6rem .75rem; margin-bottom: .6rem; background: #fff; }
+    .replica-title { font-weight: 600; margin: 0 0 .35rem; }
+  </style>
+  <script>
+    // Embed ClusterName in the template
+    window.CLUSTER_NAME = "{{.ClusterName}}";
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+  <header>
+    <a class="home-link" href="/">Stormy Redis Dashboard</a>
+  </header>
+  <main>
+    <h2>Instances</h2>
+    <div id="masters-list"></div>
+  </main>
+  <script>
+    // Helpers
+    const byId = (id) => document.getElementById(id);
+    const pathCluster = (location.pathname.replace(/^\/+|\/+$/g,'').split('/')[0]) || null;
+    const CLUSTER = window.CLUSTER_NAME || pathCluster || 'example';
+
+    const fmtI = (n) => (n==null || isNaN(n)) ? '' : String(Math.trunc(Number(n)));
+    const fmtF2 = (n) => (n==null || isNaN(n)) ? '' : Number(n).toFixed(2);
+    function formatBytes(b) {
+      if (b == null || isNaN(b)) return '';
+      const n = Number(b);
+      if (n >= 1<<30) return (n/(1<<30)).toFixed(2)+' GB';
+      if (n >= 1<<20) return (n/(1<<20)).toFixed(2)+' MB';
+      if (n >= 1<<10) return (n/(1<<10)).toFixed(2)+' KB';
+      return n + ' B';
+    }
+
+    // Per-master time-series state (keyed by index in current list)
+    const mastersState = {}; // idx -> { labels, cmd, cpuSys, cpuUsr, mem, memRss, prev, prevTime, history, charts }
+
+    function ensureMasterDOM(idx, ip, port, info) {
+      const host = `${ip ?? ''}:${port ?? ''}`;
+      const blockId = `master-block-${idx}`;
+      if (byId(blockId)) return;
+
+      const masters = byId('masters-list');
+      const cmdId = `commandsChart-${idx}`;
+      const cpuId = `cpuChart-${idx}`;
+      const memId = `memoryChart-${idx}`;
+      const histBodyId = `history-tbody-${idx}`;
+      const instBodyId = `instance-tbody-${idx}`;
+      const replicasColId = `replicas-col-${idx}`;
+
+      const block = document.createElement('section');
+      block.className = 'master-block';
+      block.id = blockId;
+      block.innerHTML = `
+        <h3>Master ${host}</h3>
+        <div class="charts-row">
+          <div class="chart-container"><canvas id="${cmdId}"></canvas></div>
+          <div class="chart-container"><canvas id="${cpuId}"></canvas></div>
+          <div class="chart-container"><canvas id="${memId}"></canvas></div>
+        </div>
+        <div style="overflow-x:auto;">
+          <table class="history-table">
+            <thead>
+              <tr>
+                <th>time</th>
+                <th>cpu_usr</th>
+                <th>cpu_sys</th>
+                <th>clients</th>
+                <th>mem</th>
+                <th>mem_rss</th>
+                <th>cmd/s</th>
+                <th>rej/s</th>
+                <th>exp/s</th>
+                <th>evt/s</th>
+                <th>hit/s</th>
+                <th>mis/s</th>
+              </tr>
+            </thead>
+            <tbody id="${histBodyId}">
+              <tr><td colspan="12" class="muted">Waiting for data...</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="info-row" style="margin-top:1rem;">
+          <div class="info-col">
+            <h4 class="muted" style="margin:0 0 .4rem;">Instance information</h4>
+            <table class="instance-info-table">
+              <tbody id="${instBodyId}">
+                <tr><th>redis_version</th><td>${info.redis_version ?? ''}</td></tr>
+                <tr><th>process_id</th><td>${info.process_id ?? ''}</td></tr>
+                <tr><th>uptime_in_seconds</th><td>${info.uptime_in_seconds ?? ''}</td></tr>
+                <tr><th>uptime_in_days</th><td>${info.uptime_in_days ?? ''}</td></tr>
+                <tr><th>role</th><td>${info.role ?? ''}</td></tr>
+                <tr><th>connected_slaves</th><td>${info.connected_slaves ?? ''}</td></tr>
+                <tr><th>ip</th><td>${ip ?? ''}</td></tr>
+                <tr><th>port</th><td>${port ?? ''}</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="info-col">
+            <h4 class="muted" style="margin:0 0 .4rem;">Replicas</h4>
+            <div id="${replicasColId}"></div>
+          </div>
+        </div>
+      `;
+      masters.appendChild(block);
+
+      // Create charts bound to master's state arrays
+      const s = mastersState[idx];
+      s.charts = s.charts || {};
+      const cmdCtx = byId(cmdId).getContext('2d');
+      const cpuCtx = byId(cpuId).getContext('2d');
+      const memCtx = byId(memId).getContext('2d');
+
+      s.charts.commands = new Chart(cmdCtx, {
+        type: 'line',
+        data: { labels: s.labels, datasets: [{ label: 'cmd/s', data: s.cmd, borderColor: 'rgba(255,133,27,0.9)', backgroundColor: 'rgba(255,133,27,0.18)', fill: true, tension: 0.35, pointRadius: 0 }] },
+        options: { responsive: true, scales: { y: { beginAtZero: true } } }
+      });
+      s.charts.cpu = new Chart(cpuCtx, {
+        type: 'line',
+        data: {
+          labels: s.labels,
+          datasets: [
+            { label: 'cpu_sys', data: s.cpuSys, borderColor: 'rgba(255,65,54,0.9)', backgroundColor: 'rgba(255,65,54,0.18)', fill: true, tension: 0.35, pointRadius: 0 },
+            { label: 'cpu_usr', data: s.cpuUsr, borderColor: 'rgba(46,204,64,0.9)', backgroundColor: 'rgba(46,204,64,0.18)', fill: true, tension: 0.35, pointRadius: 0 }
+          ]
+        },
+        options: { responsive: true, scales: { y: { beginAtZero: true } } }
+      });
+      s.charts.mem = new Chart(memCtx, {
+        type: 'line',
+        data: {
+          labels: s.labels,
+          datasets: [
+            { label: 'mem', data: s.mem, borderColor: 'rgba(0,116,217,0.9)', backgroundColor: 'rgba(0,116,217,0.18)', fill: true, tension: 0.35, pointRadius: 0 },
+            { label: 'mem_rss', data: s.memRss, borderColor: 'rgba(177,13,201,0.9)', backgroundColor: 'rgba(177,13,201,0.18)', fill: true, tension: 0.35, pointRadius: 0 }
+          ]
+        },
+        options: { responsive: true, scales: { y: { beginAtZero: true, ticks: { callback: (v) => formatBytes(v) } } } }
+      });
+    }
+
+    function ensureReplicaCard(masterIdx, repKey, ip, port, info) {
+      const col = byId(`replicas-col-${masterIdx}`);
+      if (!col) return;
+      const cardId = `replica-card-${masterIdx}-${repKey}`;
+      let card = byId(cardId);
+      const bodyId = `replica-tbody-${masterIdx}-${repKey}`;
+      if (!card) {
+        card = document.createElement('div');
+        card.className = 'replica-card';
+        card.id = cardId;
+        card.innerHTML = `
+          <div class="replica-title">Replica ${ip ?? ''}:${port ?? ''}</div>
+          <table class="instance-info-table">
+            <tbody id="${bodyId}"></tbody>
+          </table>
+        `;
+        col.appendChild(card);
+      }
+      const tbody = byId(bodyId);
+      if (tbody) {
+        tbody.innerHTML = `
+          <tr><th>redis_version</th><td>${info.redis_version ?? ''}</td></tr>
+          <tr><th>process_id</th><td>${info.process_id ?? ''}</td></tr>
+          <tr><th>uptime_in_seconds</th><td>${info.uptime_in_seconds ?? ''}</td></tr>
+          <tr><th>uptime_in_days</th><td>${info.uptime_in_days ?? ''}</td></tr>
+          <tr><th>role</th><td>${info.role ?? 'slave'}</td></tr>
+          <tr><th>ip</th><td>${ip ?? ''}</td></tr>
+          <tr><th>port</th><td>${port ?? ''}</td></tr>
+        `;
+      }
+    }
+
+    function updateMaster(idx, info, ip, port) {
+      if (!mastersState[idx]) {
+        mastersState[idx] = { labels: [], cmd: [], cpuSys: [], cpuUsr: [], mem: [], memRss: [], prev: null, prevTime: 0, history: [], charts: null };
+      }
+      const s = mastersState[idx];
+      const now = Date.now();
+      const tsLabel = new Date(now).toLocaleTimeString();
+
+      const n = (x) => (x==null || isNaN(Number(x))) ? 0 : Number(x);
+      const dt = s.prevTime ? Math.max((now - s.prevTime) / 1000, 0.001) : null;
+
+      // raw CPU (no per-second)
+      const cpu_sys_raw = n(info.used_cpu_sys);
+      const cpu_usr_raw = n(info.used_cpu_user);
+
+      // per-second rates (rounded to integers). Skip first sample.
+      let cmd_s = null, rej_s = null, exp_s = null, evt_s = null, hit_s = null, mis_s = null;
+      if (s.prev && dt) {
+        const r = (curr, prev) => Math.max(0, Math.round((n(curr) - n(prev)) / dt));
+        cmd_s = r(info.total_commands_processed, s.prev.total_commands_processed);
+        rej_s = r(info.rejected_connections, s.prev.rejected_connections);
+        exp_s = r(info.expired_keys, s.prev.expired_keys);
+        evt_s = r(info.evicted_keys, s.prev.evicted_keys);
+        hit_s = r(info.keyspace_hits, s.prev.keyspace_hits);
+        mis_s = r(info.keyspace_misses, s.prev.keyspace_misses);
+      }
+
+      // Append to series (first rate is null -> not drawn)
+      s.labels.push(tsLabel);
+      s.cmd.push(cmd_s != null ? cmd_s : null);
+      s.cpuSys.push(cpu_sys_raw);
+      s.cpuUsr.push(cpu_usr_raw);
+      s.mem.push(n(info.used_memory));
+      s.memRss.push(n(info.used_memory_rss));
+      if (s.labels.length > 1800) { s.labels.shift(); s.cmd.shift(); s.cpuSys.shift(); s.cpuUsr.shift(); s.mem.shift(); s.memRss.shift(); }
+
+      // Update history table (skip first row without rate)
+      const histBody = byId(`history-tbody-${idx}`);
+      if (cmd_s != null && histBody) {
+        s.history.unshift({
+          time: tsLabel,
+          cpu_usr: cpu_usr_raw,
+          cpu_sys: cpu_sys_raw,
+          clients: info.connected_clients,
+          mem: info.used_memory,
+          mem_rss: info.used_memory_rss,
+          cmd_s, rej_s, exp_s, evt_s, hit_s, mis_s
+        });
+        if (s.history.length > 10) s.history.pop();
+        histBody.innerHTML = s.history.map(r => `
+          <tr>
+            <td>${r.time}</td>
+            <td class="num">${fmtF2(r.cpu_usr)}</td>
+            <td class="num">${fmtF2(r.cpu_sys)}</td>
+            <td class="num">${fmtI(r.clients)}</td>
+            <td class="num">${formatBytes(r.mem)}</td>
+            <td class="num">${formatBytes(r.mem_rss)}</td>
+            <td class="num">${fmtI(r.cmd_s)}</td>
+            <td class="num">${fmtI(r.rej_s)}</td>
+            <td class="num">${fmtI(r.exp_s)}</td>
+            <td class="num">${fmtI(r.evt_s)}</td>
+            <td class="num">${fmtI(r.hit_s)}</td>
+            <td class="num">${fmtI(r.mis_s)}</td>
+          </tr>
+        `).join('');
+      } else if (histBody && !s.history.length) {
+        histBody.innerHTML = `<tr><td colspan="12" class="muted">Waiting for data...</td></tr>`;
+      }
+
+      // Instance info update (use fallback for ip/port)
+      const instBody = byId(`instance-tbody-${idx}`);
+      if (instBody) {
+        const ipDisp = (ip ?? '') || (info.ip ?? '');
+        const portDisp = (port ?? '') || (info.tcp_port ?? '');
+        instBody.innerHTML = `
+          <tr><th>redis_version</th><td>${info.redis_version ?? ''}</td></tr>
+          <tr><th>process_id</th><td>${info.process_id ?? ''}</td></tr>
+          <tr><th>uptime_in_seconds</th><td>${info.uptime_in_seconds ?? ''}</td></tr>
+          <tr><th>uptime_in_days</th><td>${info.uptime_in_days ?? ''}</td></tr>
+          <tr><th>role</th><td>${info.role ?? ''}</td></tr>
+          <tr><th>connected_slaves</th><td>${info.connected_slaves ?? ''}</td></tr>
+          <tr><th>ip</th><td>${ipDisp}</td></tr>
+          <tr><th>port</th><td>${portDisp}</td></tr>
+        `;
+      }
+
+      // Save snapshot for next diff
+      mastersState[idx].prev = {
+        total_commands_processed: info.total_commands_processed,
+        used_cpu_sys: info.used_cpu_sys,
+        used_cpu_user: info.used_cpu_user,
+        rejected_connections: info.rejected_connections,
+        expired_keys: info.expired_keys,
+        evicted_keys: info.evicted_keys,
+        keyspace_hits: info.keyspace_hits,
+        keyspace_misses: info.keyspace_misses
+      };
+      mastersState[idx].prevTime = now;
+
+      // Refresh charts
+      if (s.charts) {
+        s.charts.commands.update();
+        s.charts.cpu.update();
+        s.charts.mem.update();
+      }
+    }
+
+    // SSE: render masters; attach each slave next to its master using master_host/master_port
+    const evtSource = new EventSource(`/${CLUSTER}/events`);
+    evtSource.onmessage = (event) => {
+      let list;
+      try { list = JSON.parse(event.data); }
+      catch { byId('masters-list').innerHTML = '<div class="muted">Data parse error</div>'; return; }
+      if (!Array.isArray(list)) { byId('masters-list').innerHTML = '<div class="muted">No instances</div>'; return; }
+
+      // Build a map from master addr -> idx (in this payload)
+      const masterIndexByAddr = {};
+      list.forEach((item, idx) => {
+        const info = item.info || item || {};
+        const role = (info.role || item.role || '').toLowerCase();
+        if (role === 'master') {
+          const ip = info.ip || item.ip || '';
+          // CHANGED: fallback to port OR tcp_port
+          const port = info.tcp_port ?? item.tcp_port ?? '';
+          if (ip && port !== '') masterIndexByAddr[`${ip}:${port}`] = idx;
+        }
+      });
+
+      // Update: pass ip, port to updateMaster so we can display correct values
+      // First pass: render/update masters and ensure DOM
+      list.forEach((item, idx) => {
+        const info = item.info || item || {};
+        const role = (info.role || item.role || '').toLowerCase();
+        if (role !== 'master') return;
+        const ip = info.ip || item.ip || '';
+        // fallback to tcp_port or port
+        const port = info.tcp_port ?? item.tcp_port ?? '';
+        if (!mastersState[idx]) {
+          mastersState[idx] = { labels: [], cmd: [], cpuSys: [], cpuUsr: [], mem: [], memRss: [], prev: null, prevTime: 0, history: [], charts: null };
+          ensureMasterDOM(idx, ip, port, info);
+        }
+        // CHANGED: pass ip, port here
+        updateMaster(idx, info, ip, port);
+      });
+
+      // Clear replicas column for all masters in this payload
+      Object.values(masterIndexByAddr).forEach((mIdx) => {
+        const col = byId(`replicas-col-${mIdx}`);
+        if (col) col.innerHTML = '';
+      });
+
+      // Second pass: attach slaves to their master block
+      list.forEach((item, idx) => {
+        const info = item.info || item || {};
+        const role = (info.role || item.role || '').toLowerCase();
+        if (!(role === 'slave' || role === 'replica')) return;
+
+        const ip = info.ip || item.ip || '';
+        // CHANGED: fallback to port OR tcp_port
+        const port = info.tcp_port ?? item.tcp_port ?? '';
+        const mh = info.master_host || item.master_host || '';
+        const mp = info.master_port || item.master_port || '';
+        const masterIdx = masterIndexByAddr[`${mh}:${mp}`];
+
+        if (masterIdx != null) {
+          // stable key per slave under its master
+          const repKey = `${ip}-${port}`.replace(/[^a-zA-Z0-9_-]/g,'_');
+          ensureReplicaCard(masterIdx, repKey, ip, port, info);
+        }
+      });
+    };
+    evtSource.onerror = () => {
+      const masters = byId('masters-list');
+      if (masters && !masters.innerHTML) masters.innerHTML = '<div class="muted">SSE connection error</div>';
+    };
+  </script>
+</body>
+</html>
